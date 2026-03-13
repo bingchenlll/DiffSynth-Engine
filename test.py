@@ -120,12 +120,12 @@ new_col.save(new_im_path)
         
 
 """
-org no compile: 2.01 it/s
-org no comp with fa3: 2.35 it/s
-org compile:    2.78 it/s
-org compile with fa3:  3.06 it/s
-cuda kernels no compile: 2.17 it/s
-cuda kernels: 2.79 it/s
+org no compile:                2.01 it/s
+org no comp with fa3:          2.35 it/s
+org compile no fa3:            2.78 it/s
+org compile with fa3:          3.06 it/s
+cuda kernels no compile:       2.17 it/s
+cuda kernels compile:          2.79 it/s
 cuda kernels compile with fa3: 3.06 it/s
 
 """
