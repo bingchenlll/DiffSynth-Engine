@@ -9,6 +9,8 @@ from diffsynth_engine.models.base import StateDictConverter, PreTrainedModel
 from diffsynth_engine.models.basic import attention as attention_ops
 from diffsynth_engine.models.basic.timestep import TimestepEmbeddings
 from diffsynth_engine.models.basic.transformer_helper import AdaLayerNorm, GELU, RMSNorm
+import diffsynth_engine.models.qwen_image.qwen_image_cuda_ext  # register torch custom ops
+
 from diffsynth_engine.utils.gguf import gguf_inference
 from diffsynth_engine.utils.fp8_linear import fp8_inference
 from diffsynth_engine.utils.parallel import (
@@ -157,9 +159,170 @@ class QwenFeedForward(nn.Module):
 
 
 def apply_rotary_emb_qwen(x: torch.Tensor, freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]]):
+    if (
+        isinstance(freqs_cis, torch.Tensor)
+        and x.is_cuda
+        and freqs_cis.is_cuda
+        and x.is_contiguous()
+        and freqs_cis.is_contiguous()
+        and x.dim() == 4
+        and freqs_cis.dim() == 2
+        and x.shape[1] == freqs_cis.shape[0]
+        and x.shape[-1] % 2 == 0
+        and freqs_cis.dtype == torch.complex64
+    ):
+        return torch.ops.qwen_image_ext.rotary_emb(x, freqs_cis)
+
     x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # (b, s, h, d) -> (b, s, h, d/2, 2)
     x_out = torch.view_as_real(x_rotated * freqs_cis.unsqueeze(1)).flatten(3)  # (b, s, h, d/2, 2) -> (b, s, h, d)
     return x_out.type_as(x)
+
+
+def apply_rotary_emb_qwen_indexed(x: torch.Tensor, freqs_cis: torch.Tensor, token_indices: torch.Tensor):
+    if (
+        x.is_cuda
+        and freqs_cis.is_cuda
+        and token_indices.is_cuda
+        and x.is_contiguous()
+        and freqs_cis.is_contiguous()
+        and token_indices.is_contiguous()
+        and x.dim() == 4
+        and freqs_cis.dim() == 2
+        and token_indices.dim() == 1
+        and x.shape[1] == token_indices.shape[0]
+        and x.shape[-1] % 2 == 0
+        and freqs_cis.dtype == torch.complex64
+        and token_indices.dtype in (torch.int32, torch.int64)
+    ):
+        return torch.ops.qwen_image_ext.rotary_emb_indexed(x, freqs_cis, token_indices)
+    return apply_rotary_emb_qwen(x, freqs_cis.index_select(0, token_indices))
+
+
+def apply_rotary_emb_qwen_pair(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x1.is_cuda
+        and x2.is_cuda
+        and freqs_cis.is_cuda
+        and x1.is_contiguous()
+        and x2.is_contiguous()
+        and freqs_cis.is_contiguous()
+        and x1.shape == x2.shape
+        and x1.dim() == 4
+        and freqs_cis.dim() == 2
+        and x1.shape[1] == freqs_cis.shape[0]
+        and x1.shape[-1] % 2 == 0
+        and x1.dtype == x2.dtype
+        and freqs_cis.dtype == torch.complex64
+    ):
+        return torch.ops.qwen_image_ext.rotary_emb_pair(x1, x2, freqs_cis)
+    return apply_rotary_emb_qwen(x1, freqs_cis), apply_rotary_emb_qwen(x2, freqs_cis)
+
+
+def apply_rotary_emb_qwen_pair_indexed(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    token_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x1.is_cuda
+        and x2.is_cuda
+        and freqs_cis.is_cuda
+        and token_indices.is_cuda
+        and x1.is_contiguous()
+        and x2.is_contiguous()
+        and freqs_cis.is_contiguous()
+        and token_indices.is_contiguous()
+        and x1.shape == x2.shape
+        and x1.dim() == 4
+        and freqs_cis.dim() == 2
+        and token_indices.dim() == 1
+        and x1.shape[1] == token_indices.shape[0]
+        and x1.shape[-1] % 2 == 0
+        and x1.dtype == x2.dtype
+        and freqs_cis.dtype == torch.complex64
+        and token_indices.dtype in (torch.int32, torch.int64)
+    ):
+        return torch.ops.qwen_image_ext.rotary_emb_pair_indexed(x1, x2, freqs_cis, token_indices)
+    freqs_selected = freqs_cis.index_select(0, token_indices)
+    return apply_rotary_emb_qwen(x1, freqs_selected), apply_rotary_emb_qwen(x2, freqs_selected)
+
+
+def apply_rotary_cat_qkv_qwen(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if rotary_emb is None:
+        return torch.cat([txt_q, img_q], dim=1), torch.cat([txt_k, img_k], dim=1), torch.cat([txt_v, img_v], dim=1)
+
+    img_freqs, txt_freqs = rotary_emb
+    if (
+        img_q.is_cuda
+        and img_k.is_cuda
+        and img_v.is_cuda
+        and txt_q.is_cuda
+        and txt_k.is_cuda
+        and txt_v.is_cuda
+        and img_freqs.is_cuda
+        and txt_freqs.is_cuda
+        and img_q.is_contiguous()
+        and img_k.is_contiguous()
+        and img_v.is_contiguous()
+        and txt_q.is_contiguous()
+        and txt_k.is_contiguous()
+        and txt_v.is_contiguous()
+        and img_freqs.is_contiguous()
+        and txt_freqs.is_contiguous()
+        and img_q.shape == img_k.shape == img_v.shape
+        and txt_q.shape == txt_k.shape == txt_v.shape
+        and img_q.dim() == 4
+        and txt_q.dim() == 4
+        and img_q.shape[0] == txt_q.shape[0]
+        and img_q.shape[2] == txt_q.shape[2]
+        and img_q.shape[3] == txt_q.shape[3]
+        and img_q.shape[1] == img_freqs.shape[0]
+        and txt_q.shape[1] == txt_freqs.shape[0]
+        and img_q.shape[3] % 2 == 0
+        and img_q.dtype == img_k.dtype == img_v.dtype == txt_q.dtype == txt_k.dtype == txt_v.dtype
+        and img_freqs.dtype == torch.complex64
+        and txt_freqs.dtype == torch.complex64
+    ):
+        return torch.ops.qwen_image_ext.rotary_cat_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, img_freqs, txt_freqs)
+
+    img_q, img_k = apply_rotary_emb_qwen_pair(img_q, img_k, img_freqs)
+    txt_q, txt_k = apply_rotary_emb_qwen_pair(txt_q, txt_k, txt_freqs)
+    return torch.cat([txt_q, img_q], dim=1), torch.cat([txt_k, img_k], dim=1), torch.cat([txt_v, img_v], dim=1)
+
+
+def apply_gated_residual_qwen(base: torch.Tensor, gate: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
+    if (
+        base.is_cuda
+        and gate.is_cuda
+        and update.is_cuda
+        and base.is_contiguous()
+        and gate.is_contiguous()
+        and update.is_contiguous()
+        and base.dim() == 3
+        and gate.dim() == 3
+        and update.dim() == 3
+        and update.shape == base.shape
+        and gate.shape[0] == base.shape[0]
+        and gate.shape[2] == base.shape[2]
+        and gate.shape[1] in (1, base.shape[1])
+        and base.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and base.dtype == gate.dtype == update.dtype
+    ):
+        return torch.ops.qwen_image_ext.gated_residual(base, gate, update)
+    return base + gate * update
 
 
 @dataclass
@@ -237,10 +400,8 @@ class QwenDoubleStreamAttention(nn.Module):
         if rotary_emb is None:
             return img_q, img_k, txt_q, txt_k
         img_freqs, txt_freqs = rotary_emb
-        img_q = apply_rotary_emb_qwen(img_q, img_freqs)
-        img_k = apply_rotary_emb_qwen(img_k, img_freqs)
-        txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs)
-        txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs)
+        img_q, img_k = apply_rotary_emb_qwen_pair(img_q, img_k, img_freqs)
+        txt_q, txt_k = apply_rotary_emb_qwen_pair(txt_q, txt_k, txt_freqs)
         return img_q, img_k, txt_q, txt_k
 
     def apply_image_rotary(
@@ -251,18 +412,21 @@ class QwenDoubleStreamAttention(nn.Module):
         token_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         if token_indices is not None:
-            img_freqs = img_freqs.index_select(0, token_indices)
+            if img_q is not None:
+                img_q, img_k = apply_rotary_emb_qwen_pair_indexed(img_q, img_k, img_freqs, token_indices)
+            else:
+                img_k = apply_rotary_emb_qwen_indexed(img_k, img_freqs, token_indices)
+            return img_q, img_k
         if img_q is not None:
-            img_q = apply_rotary_emb_qwen(img_q, img_freqs)
+            img_q, img_k = apply_rotary_emb_qwen_pair(img_q, img_k, img_freqs)
+            return img_q, img_k
         img_k = apply_rotary_emb_qwen(img_k, img_freqs)
         return img_q, img_k
 
     def apply_text_rotary(
         self, txt_q: torch.Tensor, txt_k: torch.Tensor, txt_freqs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs)
-        txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs)
-        return txt_q, txt_k
+        return apply_rotary_emb_qwen_pair(txt_q, txt_k, txt_freqs)
 
     def forward(
         self,
@@ -275,19 +439,24 @@ class QwenDoubleStreamAttention(nn.Module):
         img_q, img_k, img_v = self.project_image_qkv(image)
         txt_q, txt_k, txt_v = self.project_text_qkv(text)
         img_q, img_k, txt_q, txt_k = self.normalize_qk(img_q, img_k, txt_q, txt_k)
-        img_q, img_k, txt_q, txt_k = self.apply_rotary(img_q, img_k, txt_q, txt_k, rotary_emb)
-
-        joint_q = torch.cat([txt_q, img_q], dim=1)
-        joint_k = torch.cat([txt_k, img_k], dim=1)
-        joint_v = torch.cat([txt_v, img_v], dim=1)
+        joint_q, joint_k, joint_v = apply_rotary_cat_qkv_qwen(
+            img_q=img_q,
+            img_k=img_k,
+            img_v=img_v,
+            txt_q=txt_q,
+            txt_k=txt_k,
+            txt_v=txt_v,
+            rotary_emb=rotary_emb,
+        )
 
         attn_kwargs = attn_kwargs if attn_kwargs is not None else {}
         joint_attn_out = attention_ops.attention(joint_q, joint_k, joint_v, attn_mask=attn_mask, **attn_kwargs)
 
-        joint_attn_out = rearrange(joint_attn_out, "b s h d -> b s (h d)").to(joint_q.dtype)
-
-        txt_attn_output = joint_attn_out[:, : text.shape[1], :]
-        img_attn_output = joint_attn_out[:, text.shape[1] :, :]
+        joint_attn_out = joint_attn_out.reshape(joint_attn_out.shape[0], joint_attn_out.shape[1], -1).to(joint_q.dtype)
+        txt_len = text.shape[1]
+        txt_attn_output, img_attn_output = torch.split(
+            joint_attn_out, [txt_len, joint_attn_out.shape[1] - txt_len], dim=1
+        )
 
         img_attn_output = self.to_out(img_attn_output)
         txt_attn_output = self.to_add_out(txt_attn_output)
@@ -339,10 +508,13 @@ class QwenDoubleStreamAttention(nn.Module):
             )
             attn_mask_dyn = attn_mask.index_select(2, query_indices)
         joint_attn_out = attention_ops.attention(joint_q, joint_k, joint_v, attn_mask=attn_mask_dyn, **attn_kwargs)
-        joint_attn_out = rearrange(joint_attn_out, "b s h d -> b s (h d)").to(joint_q.dtype)
-
-        txt_attn_output = self.to_add_out(joint_attn_out[:, : text.shape[1], :])
-        img_attn_output = self.to_out(joint_attn_out[:, text.shape[1] :, :])
+        joint_attn_out = joint_attn_out.reshape(joint_attn_out.shape[0], joint_attn_out.shape[1], -1).to(joint_q.dtype)
+        txt_len = text.shape[1]
+        txt_attn_output, img_attn_output = torch.split(
+            joint_attn_out, [txt_len, joint_attn_out.shape[1] - txt_len], dim=1
+        )
+        txt_attn_output = self.to_add_out(txt_attn_output)
+        img_attn_output = self.to_out(img_attn_output)
         return img_attn_output, txt_attn_output
 
 
@@ -427,13 +599,13 @@ class QwenImageTransformerBlock(nn.Module):
         img_normed_2 = self.img_norm2(image)
         img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp, img_modulate_index)
         img_mlp_out = self.img_mlp(img_modulated_2)
-        return image + img_gate_2 * img_mlp_out
+        return apply_gated_residual_qwen(image, img_gate_2, img_mlp_out)
 
     def _apply_txt_mlp_residual(self, text: torch.Tensor, txt_mod_mlp: torch.Tensor) -> torch.Tensor:
         txt_normed_2 = self.txt_norm2(text)
         txt_modulated_2, txt_gate_2 = self._modulate(txt_normed_2, txt_mod_mlp)
         txt_mlp_out = self.txt_mlp(txt_modulated_2)
-        return text + txt_gate_2 * txt_mlp_out
+        return apply_gated_residual_qwen(text, txt_gate_2, txt_mlp_out)
 
     def _get_static_token_indices(self, modulate_index: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if modulate_index is None:
@@ -466,6 +638,32 @@ class QwenImageTransformerBlock(nn.Module):
         return img_k_static, img_v_static
 
     def _modulate(self, x, mod_params, index=None):
+        if (
+            x.is_cuda
+            and mod_params.is_cuda
+            and x.is_contiguous()
+            and mod_params.is_contiguous()
+            and x.dim() == 3
+            and mod_params.dim() == 2
+            and mod_params.shape[1] == x.shape[2] * 3
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and mod_params.dtype == x.dtype
+        ):
+            if index is None and mod_params.shape[0] == x.shape[0]:
+                return torch.ops.qwen_image_ext.modulate(x, mod_params)
+
+            if (
+                index is not None
+                and index.is_cuda
+                and index.is_contiguous()
+                and index.dim() == 3
+                and index.shape[1] == x.shape[1]
+                and index.shape[2] == 1
+                and mod_params.shape[0] == x.shape[0] * 2
+                and index.dtype in (torch.int32, torch.int64)
+            ):
+                return torch.ops.qwen_image_ext.modulate_indexed(x, mod_params, index)
+
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
             actual_batch = shift.size(0) // 2
@@ -524,9 +722,10 @@ class QwenImageTransformerBlock(nn.Module):
                 attn_kwargs=attn_kwargs,
             )
 
-            image = image + img_gate * img_attn_out
-            text = text + txt_gate * txt_attn_out
+            image = apply_gated_residual_qwen(image, img_gate, img_attn_out)
             image = self._apply_img_mlp_residual(image, img_mod_mlp, img_modulate_index)
+
+            text = apply_gated_residual_qwen(text, txt_gate, txt_attn_out)
             text = self._apply_txt_mlp_residual(text, txt_mod_mlp)
 
             if use_static_cache:
@@ -551,11 +750,11 @@ class QwenImageTransformerBlock(nn.Module):
                 attn_kwargs=attn_kwargs,
                 image_token_indices=dynamic_indices,
             )
-            text = text + txt_gate * txt_attn_out
-
-            image = image + img_gate * img_attn_dyn_out
-            image = self._apply_img_mlp_residual(image, img_mod_mlp, img_modulate_index)
+            text = apply_gated_residual_qwen(text, txt_gate, txt_attn_out)
             text = self._apply_txt_mlp_residual(text, txt_mod_mlp)
+
+            image = apply_gated_residual_qwen(image, img_gate, img_attn_dyn_out)
+            image = self._apply_img_mlp_residual(image, img_mod_mlp, img_modulate_index)
 
         return text, image
 
